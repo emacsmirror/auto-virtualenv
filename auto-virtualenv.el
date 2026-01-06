@@ -3,7 +3,7 @@
 ;; Author: Marcwebbie <marcwebbie@gmail.com>
 ;; Maintainer: Marcwebbie <marcwebbie@gmail.com>
 ;; URL: https://github.com/marcwebbie/auto-virtualenv
-;; Version: 2.3.0
+;; Version: 2.4.0
 ;; Keywords: python, virtualenv, environment, tools, projects
 ;; Package-Requires: ((cl-lib "0.5"))
 ;; License: GPL-3.0-or-later
@@ -44,8 +44,7 @@
 ;;; Code:
 
 (require 'cl-lib)
-(require 'json)
-(require 'projectile)
+(require 'projectile nil t)
 
 (defgroup auto-virtualenv nil
   "Automatically activate Python virtual environments."
@@ -140,13 +139,53 @@
                  venv-path)))
            auto-virtualenv-global-dirs))
 
+(defun auto-virtualenv--git-has-python-p (dir)
+  "Check if DIR is a git repo tracking any .py files."
+  (and (file-directory-p (expand-file-name ".git" dir))
+       (executable-find "git")
+       (with-temp-buffer
+         (let ((default-directory dir))
+           ;; ls-files is instant; it reads the binary index, not the disk.
+           ;; We check for at least one .py file.
+           (eq 0 (call-process "git" nil nil nil "ls-files" "--error-unmatch" "*.py"))))))
+
+(defun auto-virtualenv--recursive-has-python-p (dir &optional depth)
+  "Recursively scan DIR for .py files, stopping immediately on first match.
+DEPTH defaults to 3 to prevent runaway scanning."
+  (let ((depth (or depth 3))
+        (files (directory-files dir t nil t)))
+    (catch 'found
+      (dolist (file files)
+        (let ((name (file-name-nondirectory file)))
+          (unless (member name '("." ".."))
+            (cond
+             ;; Found a python file? Stop immediately.
+             ((and (string-suffix-p ".py" name)
+                   (not (file-directory-p file)))
+              (throw 'found t))
+             ;; Directory? Recurse if depth allows and not ignored.
+             ((and (> depth 0)
+                   (file-directory-p file)
+                   (not (member name '(".git" "node_modules" "__pycache__" ".venv" "venv"))))
+              (when (auto-virtualenv--recursive-has-python-p file (1- depth))
+                (throw 'found t)))))))
+      nil)))
+
 (defun auto-virtualenv-is-python-project (project-root)
   "Check if PROJECT-ROOT contains Python project files."
   (auto-virtualenv--debug "Checking if %s has Python project files" project-root)
-  (or (cl-some (lambda (file)
-                 (file-expand-wildcards (expand-file-name file project-root)))
-               auto-virtualenv-python-project-files)
-      (directory-files-recursively project-root "\\.py$" 2)))
+  (or
+   ;; 1. Fast Check: Markers (setup.py, pyproject.toml, etc.)
+   (cl-some (lambda (file)
+              (file-expand-wildcards (expand-file-name file project-root)))
+            auto-virtualenv-python-project-files)
+
+   ;; 2. Fastest Search: Git Index
+   (auto-virtualenv--git-has-python-p project-root)
+
+   ;; 3. Fallback Search: Optimized recursive scan
+   ;; Only runs if markers are missing AND it's not a git repo (or git fails)
+   (auto-virtualenv--recursive-has-python-p project-root)))
 
 (defun auto-virtualenv-activate (venv-path)
   "Activate the virtual environment at VENV-PATH."
@@ -175,18 +214,28 @@
     (auto-virtualenv-update-mode-line)))
 
 (defun auto-virtualenv-locate-project-root ()
-  "Find the project root using `projectile-project-root` if available, else search for `.git` markers."
-  (if (and (featurep 'projectile) (fboundp 'projectile-project-root))
-      (projectile-project-root)
-    (let ((dir (locate-dominating-file default-directory
-                                       (lambda (parent)
-                                         (cl-some (lambda (marker)
-                                                    (file-exists-p (expand-file-name marker parent)))
-                                                  '(".git" "setup.py" "Pipfile" "pyproject.toml"))))))
-      (if dir
-          (expand-file-name dir)
-        (auto-virtualenv--debug "No project root found.")
-        nil))))
+  "Find the project root using `project.el`, `projectile`, or manual markers."
+  (let ((root (or (and (fboundp 'project-current)
+                       (project-current)
+                       (let ((pr-root (project-root (project-current))))
+                         (auto-virtualenv--debug "Project root found by project.el: %s" pr-root)
+                         pr-root))
+                  (and (featurep 'projectile)
+                       (fboundp 'projectile-project-root)
+                       (let ((proj-root (projectile-project-root)))
+                         (auto-virtualenv--debug "Project root found by projectile: %s" proj-root)
+                         proj-root))
+                  (let ((dir (locate-dominating-file default-directory
+                                                     (lambda (parent)
+                                                       (cl-some (lambda (marker)
+                                                                  (file-exists-p (expand-file-name marker parent)))
+                                                                '(".git" "setup.py" "Pipfile" "pyproject.toml"))))))
+                    (when dir
+                      (auto-virtualenv--debug "Project root found by manual markers: %s" dir)
+                      (expand-file-name dir))))))
+    (if root
+        root
+      (progn (auto-virtualenv--debug "No project root found.") nil))))
 
 (defun auto-virtualenv-find-and-activate ()
   "Find and activate a virtual environment based on the current project."
